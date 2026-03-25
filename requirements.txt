@@ -1,0 +1,6 @@
+pandas
+openpyxl
+requests
+tqdm
+nltk
+pyenchant
