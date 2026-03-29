@@ -2,15 +2,16 @@
 crawlReviewCty.py
 -----------------
 Web scraper for congty.review - Vietnamese company review platform.
-Crawls all companies and their reviews, exports to CSV format.
+Crawls all companies and their reviews, exports to Excel (.xlsx) or CSV.
 
 Usage:
-    python crawlReviewCty.py [--output PATH] [--test N] [--resume]
+    python crawlReviewCty.py [--output PATH] [--test N] [--resume] [--max-reviews N]
     
 Examples:
-    python crawlReviewCty.py                                    # Full crawl
+    python crawlReviewCty.py                                    # Full crawl → reviews_congty.xlsx
     python crawlReviewCty.py --test 5                          # Test with 5 companies
-    python crawlReviewCty.py --output reviews.csv --resume     # Resume interrupted crawl
+    python crawlReviewCty.py --max-reviews 20000                # Stop at 20,000 review rows total
+    python crawlReviewCty.py --output reviews.csv --resume     # CSV + resume interrupted crawl
 """
 
 import argparse
@@ -40,6 +41,10 @@ try:
 except ImportError:
     MISSING.append("pandas")
 try:
+    import openpyxl  # noqa: F401 – required for .xlsx output (pandas)
+except ImportError:
+    MISSING.append("openpyxl")
+try:
     from tqdm import tqdm
 except ImportError:
     MISSING.append("tqdm")
@@ -59,6 +64,11 @@ REQUEST_DELAY = 1.5  # Delay between requests in seconds
 REQUEST_TIMEOUT = 10  # Request timeout in seconds
 MAX_RETRIES = 3
 CHECKPOINT_INTERVAL = 50  # Save checkpoint every N companies
+
+REVIEW_FIELDNAMES = [
+    'reviewer_id', 'timestamp', 'review_content',
+    'company_name', 'company_type', 'company_size', 'company_address',
+]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -472,32 +482,80 @@ def load_checkpoint(output_path: Path) -> Optional[Tuple[List[Dict[str, str]], i
         return None
 
 
-def save_reviews_to_csv(reviews: List[Dict[str, str]], output_path: Path, mode: str = 'a'):
-    """Save reviews to CSV file."""
+def count_reviews_in_output(output_path: Path) -> int:
+    """Count data rows in existing review file (CSV or Excel)."""
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return 0
+    suffix = output_path.suffix.lower()
+    try:
+        if suffix == '.xlsx':
+            df = pd.read_excel(output_path, engine='openpyxl')
+            return len(df)
+        if suffix == '.csv':
+            with open(output_path, newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader, None)  # skip header
+                return sum(1 for _ in reader)
+        logger.warning(f"Unsupported output format: {output_path}")
+        return 0
+    except Exception as e:
+        logger.warning(f"Could not count rows in {output_path}: {e}")
+        return 0
+
+
+def save_reviews_to_csv(reviews: List[Dict[str, str]], output_path: Path, mode: str = 'a') -> None:
+    """Append reviews to a CSV file."""
     if not reviews:
         return
-    
-    fieldnames = [
-        'reviewer_id', 'timestamp', 'review_content',
-        'company_name', 'company_type', 'company_size', 'company_address'
-    ]
-    
+
     file_exists = output_path.exists() and output_path.stat().st_size > 0
-    
+
     try:
         with open(output_path, mode=mode, newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            
+            writer = csv.DictWriter(f, fieldnames=REVIEW_FIELDNAMES)
+
             if not file_exists or mode == 'w':
                 writer.writeheader()
-            
+
             for review in reviews:
-                # Ensure all fields exist
-                row = {field: review.get(field, '') for field in fieldnames}
+                row = {field: review.get(field, '') for field in REVIEW_FIELDNAMES}
                 writer.writerow(row)
-        
+
     except Exception as e:
         logger.error(f"Failed to save reviews to CSV: {e}")
+
+
+def save_reviews_to_xlsx(reviews: List[Dict[str, str]], output_path: Path) -> None:
+    """Append reviews to an Excel file (read + concat + overwrite)."""
+    if not reviews:
+        return
+    try:
+        new_df = pd.DataFrame(
+            [{field: review.get(field, '') for field in REVIEW_FIELDNAMES} for review in reviews]
+        )
+        if output_path.exists() and output_path.stat().st_size > 0:
+            old_df = pd.read_excel(output_path, engine='openpyxl')
+            out_df = pd.concat([old_df, new_df], ignore_index=True)
+        else:
+            out_df = new_df
+        out_df.to_excel(output_path, index=False, engine='openpyxl')
+    except Exception as e:
+        logger.error(f"Failed to save reviews to Excel: {e}")
+
+
+def append_reviews(reviews: List[Dict[str, str]], output_path: Path) -> None:
+    """Append review rows; format is chosen from file extension (.xlsx or .csv)."""
+    if not reviews:
+        return
+    suffix = output_path.suffix.lower()
+    if suffix == '.xlsx':
+        save_reviews_to_xlsx(reviews, output_path)
+    elif suffix == '.csv':
+        save_reviews_to_csv(reviews, output_path, mode='a')
+    else:
+        logger.error(
+            f"Unsupported --output extension {suffix!r}; use .xlsx or .csv"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +570,8 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        default='reviews_congty.csv',
-        help='Output CSV file path (default: reviews_congty.csv)'
+        default='reviews_congty.xlsx',
+        help='Output file path: .xlsx (default) or .csv',
     )
     parser.add_argument(
         '--test',
@@ -526,15 +584,31 @@ def main():
         action='store_true',
         help='Resume from checkpoint if available'
     )
-    
+    parser.add_argument(
+        '--max-reviews',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Stop when total review rows in the output file reaches N (e.g. 20000). '
+             'Existing rows in the file are counted when resuming.',
+    )
+
     args = parser.parse_args()
+
+    if args.max_reviews is not None and args.max_reviews < 1:
+        parser.error('--max-reviews must be a positive integer')
     output_path = Path(args.output)
+    out_suffix = output_path.suffix.lower()
+    if out_suffix not in ('.xlsx', '.csv'):
+        parser.error('--output must end with .xlsx or .csv')
     
     logger.info("=" * 60)
     logger.info("Starting congty.review crawler")
     logger.info(f"Output file: {output_path}")
     if args.test:
         logger.info(f"Test mode: {args.test} companies")
+    if args.max_reviews:
+        logger.info(f"Target: stop at {args.max_reviews} review rows (total in output file)")
     logger.info("=" * 60)
     
     # Step 1: Get company list
@@ -557,31 +631,51 @@ def main():
         save_checkpoint(companies, output_path, 0)
     
     # Step 2: Crawl reviews for each company
-    total_reviews = 0
-    
+    total_reviews = count_reviews_in_output(output_path) if args.max_reviews else 0
+    if args.max_reviews and total_reviews > 0:
+        logger.info(f"Existing review rows in output file: {total_reviews}")
+
     for idx, company in enumerate(tqdm(companies[start_index:], desc="Crawling reviews", initial=start_index, total=len(companies))):
         actual_idx = start_index + idx
-        
+
+        if args.max_reviews and total_reviews >= args.max_reviews:
+            logger.info(f"Already at or above target ({args.max_reviews} reviews). Stopping.")
+            break
+
         # Skip if no reviews
         if company.get('review_count', 0) == 0:
             logger.debug(f"Skipping {company['company_name']} (no reviews)")
             continue
-        
+
         # Crawl reviews
         reviews = crawl_company_reviews(company)
-        
-        # Save reviews incrementally
-        if reviews:
-            save_reviews_to_csv(reviews, output_path, mode='a')
-            total_reviews += len(reviews)
-        
+
+        if not reviews:
+            continue
+
+        if args.max_reviews:
+            remaining = args.max_reviews - total_reviews
+            if remaining <= 0:
+                break
+            if len(reviews) > remaining:
+                reviews = reviews[:remaining]
+
+        append_reviews(reviews, output_path)
+        total_reviews += len(reviews)
+
         # Periodic checkpoint
         if (actual_idx + 1) % CHECKPOINT_INTERVAL == 0:
             save_checkpoint(companies, output_path, actual_idx + 1)
-    
-    # Final checkpoint
-    save_checkpoint(companies, output_path, len(companies))
-    
+
+        if args.max_reviews and total_reviews >= args.max_reviews:
+            logger.info(f"Reached target of {args.max_reviews} review rows. Stopping crawl.")
+            save_checkpoint(companies, output_path, actual_idx + 1)
+            break
+
+    # Mark every company processed only if we did not stop early due to --max-reviews
+    if args.max_reviews is None or total_reviews < args.max_reviews:
+        save_checkpoint(companies, output_path, len(companies))
+
     logger.info("=" * 60)
     logger.info("Crawling complete!")
     logger.info(f"Total companies: {len(companies)}")
