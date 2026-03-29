@@ -4,3 +4,5 @@ requests
 tqdm
 nltk
 pyenchant
+beautifulsoup4
+lxml
