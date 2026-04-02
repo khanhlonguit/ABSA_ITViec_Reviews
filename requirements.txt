@@ -6,3 +6,4 @@ nltk
 pyenchant
 beautifulsoup4
 lxml
+emoji
