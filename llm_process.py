@@ -13,6 +13,10 @@ Sử dụng:
     python llm_process.py 100_review.xlsx --test 5
     python llm_process.py 100_review.xlsx --output result.csv --rerun
 
+    # Dùng Groq thay vì Ollama:
+    python llm_process.py 100_review.xlsx --provider groq --groq-api-key <KEY>
+    python llm_process.py 100_review.xlsx --provider groq --groq-api-key <KEY> --model llama-3.3-70b-versatile
+
 Cấu trúc output CSV thêm các cột:
     is_review         : true/false
     review_masked     : text đã mask tên công ty
@@ -28,7 +32,6 @@ import re
 import sys
 import time
 from pathlib import Path
-
 from prompt_toolkit import prompt
 
 MISSING = []
@@ -44,6 +47,10 @@ try:
     from tqdm import tqdm
 except ImportError:
     MISSING.append("tqdm")
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    MISSING.append("python-dotenv")
 
 if MISSING:
     print("Thiếu các thư viện sau. Hãy cài bằng lệnh:")
@@ -156,6 +163,58 @@ def call_ollama(prompt: str, model: str, base_url: str, retries: int = 2, timeou
 
 
 # ---------------------------------------------------------------------------
+# Groq API  (OpenAI-compatible chat completions)
+# ---------------------------------------------------------------------------
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+
+def call_groq(prompt: str, model: str, api_key: str, retries: int = 6, timeout: int = 120) -> str:
+    """Gọi Groq API (OpenAI-compatible). Trả về nội dung text từ assistant."""
+    if not api_key:
+        raise ValueError("Groq API key chưa được cung cấp. Dùng --groq-api-key hoặc biến môi trường GROQ_API_KEY.")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "stream": False,
+    }
+    last_error = None
+    for attempt in range(1, retries + 2):
+        try:
+            resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code == 429:
+                # Đọc Retry-After header (giây), fallback exponential backoff
+                retry_after = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset-requests")
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    wait = min(2 ** attempt, 60)  # max 60s
+                logger.error("Groq 429 rate-limit | attempt=%d | wait=%.1fs", attempt, wait)
+                if attempt <= retries:
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"Groq rate-limit vượt giới hạn sau {retries + 1} lần")
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt <= retries:
+                time.sleep(min(2 * attempt, 30))
+    raise RuntimeError(f"Groq API thất bại sau {retries + 1} lần: {last_error}")
+
+
+# ---------------------------------------------------------------------------
 # JSON extraction — strip markdown fences if LLM wraps output
 # ---------------------------------------------------------------------------
 def extract_json_str(raw: str) -> str:
@@ -233,7 +292,14 @@ def parse_result(raw: str, fallback_text: str) -> dict:
 # ---------------------------------------------------------------------------
 # Process a single row
 # ---------------------------------------------------------------------------
-def process_row(review_text: str, company_name: str, model: str, base_url: str) -> dict:
+def process_row(
+    review_text: str,
+    company_name: str,
+    model: str,
+    base_url: str,
+    provider: str = "ollama",
+    groq_api_key: str = "",
+) -> dict:
     review = str(review_text).strip() if pd.notna(review_text) else ""
     company = str(company_name).strip() if pd.notna(company_name) else ""
 
@@ -246,12 +312,15 @@ def process_row(review_text: str, company_name: str, model: str, base_url: str) 
             "aspect_sentiments": "",
         }
 
-    prompt = USER_TEMPLATE.format(company_name=company, review=review)  
+    user_prompt = USER_TEMPLATE.format(company_name=company, review=review)
     try:
-        raw = call_ollama(prompt, model=model, base_url=base_url)
+        if provider == "groq":
+            raw = call_groq(user_prompt, model=model, api_key=groq_api_key)
+        else:
+            raw = call_ollama(user_prompt, model=model, base_url=base_url)
         return parse_result(raw, fallback_text=review)
     except Exception as exc:
-        logger.error("Lỗi API | company=%r | review=%r | error=%s", company, review[:80], exc)
+        logger.error("Lỗi API | provider=%s | company=%r | review=%r | error=%s", provider, company, review[:80], exc)
         return {
             "is_review": "ERROR",
             "review_masked": review,
@@ -283,13 +352,25 @@ def main():
                         help="Chỉ chạy N dòng đầu để kiểm tra")
     parser.add_argument("--rerun", action="store_true",
                         help="Xử lý lại các dòng đã có kết quả")
-    parser.add_argument("--model", default="gpt-oss:20b",
-                        help="Tên model Ollama (mặc định: gpt-oss:20b)")
+    parser.add_argument("--provider", default="ollama", choices=["ollama", "groq"],
+                        help="LLM provider: 'ollama' (mặc định) hoặc 'groq'")
+    parser.add_argument("--model", default=None,
+                        help="Tên model (mặc định: gpt-oss:20b cho ollama, llama-3.3-70b-versatile cho groq)")
     parser.add_argument("--ollama-url", default="http://14.224.236.84:8003/",
                         help="URL Ollama server")
+    parser.add_argument("--delay", type=float, default=0.5, metavar="SEC",
+                        help="Thời gian chờ (giây) giữa mỗi request Groq, giảm 429 (mặc định 0.5)")
     parser.add_argument("--output", default=None, metavar="CSV_PATH",
                         help="Đường dẫn file CSV output")
     args = parser.parse_args()
+
+    # Resolve model default theo provider
+    import os
+    load_dotenv()  # nạp .env từ thư mục hiện tại (nếu có)
+    if args.model is None:
+        args.model = GROQ_DEFAULT_MODEL if args.provider == "groq" else "gpt-oss:20b"
+    # Groq API key: ưu tiên CLI → .env / biến môi trường
+    groq_api_key = os.environ.get("GROQ_API_KEY", "")
 
     csv_path = Path(args.csv_file)
     if not csv_path.exists():
@@ -346,18 +427,38 @@ def main():
 
     print(f"File output: {output_path}")
 
-    # Kiểm tra kết nối Ollama
-    print(f"\nKiểm tra kết nối Ollama tại {args.ollama_url} ...")
-    try:
-        resp = requests.get(args.ollama_url.rstrip("/") + "/api/tags", timeout=10)
-        resp.raise_for_status()
-        models = [m["name"] for m in resp.json().get("models", [])]
-        if models and args.model not in models:
-            print(f"  [CẢNH BÁO] Model '{args.model}' không thấy trong: {models}")
-        else:
-            print(f"  ✓ Kết nối OK.")
-    except Exception as exc:
-        print(f"  [CẢNH BÁO] Không kiểm tra được Ollama: {exc}")
+    # Kiểm tra kết nối provider
+    if args.provider == "groq":
+        print(f"\nKiểm tra kết nối Groq (model: {args.model}) ...")
+        if not groq_api_key:
+            print("  [LỖI] Chưa có Groq API key. Truyền qua --groq-api-key hoặc biến môi trường GROQ_API_KEY.")
+            sys.exit(1)
+        try:
+            resp = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {groq_api_key}"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            available = [m["id"] for m in resp.json().get("data", [])]
+            if available and args.model not in available:
+                print(f"  [CẢNH BÁO] Model '{args.model}' không thấy trong danh sách Groq: {available}")
+            else:
+                print(f"  ✓ Kết nối Groq OK.")
+        except Exception as exc:
+            print(f"  [CẢNH BÁO] Không kiểm tra được Groq: {exc}")
+    else:
+        print(f"\nKiểm tra kết nối Ollama tại {args.ollama_url} ...")
+        try:
+            resp = requests.get(args.ollama_url.rstrip("/") + "/api/tags", timeout=10)
+            resp.raise_for_status()
+            models = [m["name"] for m in resp.json().get("models", [])]
+            if models and args.model not in models:
+                print(f"  [CẢNH BÁO] Model '{args.model}' không thấy trong: {models}")
+            else:
+                print(f"  ✓ Kết nối OK.")
+        except Exception as exc:
+            print(f"  [CẢNH BÁO] Không kiểm tra được Ollama: {exc}")
 
     # Vòng lặp xử lý
     rows_to_process = df[mask].index.tolist()
@@ -372,7 +473,13 @@ def main():
             company_name=df.at[idx, col_company],
             model=args.model,
             base_url=args.ollama_url,
+            provider=args.provider,
+            groq_api_key=groq_api_key,
         )
+
+        # Thêm delay giữa các request Groq để tránh 429
+        if args.provider == "groq" and args.delay > 0:
+            time.sleep(args.delay)
         df.at[idx, "is_review"] = str(result["is_review"]) if result["is_review"] is not None else ""
         df.at[idx, "review_masked"] = result["review_masked"]
         df.at[idx, "aspect_labels"] = result["aspect_labels"]

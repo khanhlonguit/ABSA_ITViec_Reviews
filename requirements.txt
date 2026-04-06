@@ -7,3 +7,4 @@ pyenchant
 beautifulsoup4
 lxml
 emoji
+dotenv
