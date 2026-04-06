@@ -29,15 +29,13 @@ import sys
 import time
 from pathlib import Path
 
+from prompt_toolkit import prompt
+
 MISSING = []
 try:
     import pandas as pd
 except ImportError:
     MISSING.append("pandas")
-try:
-    import openpyxl  # noqa: F401
-except ImportError:
-    MISSING.append("openpyxl")
 try:
     import requests
 except ImportError:
@@ -63,12 +61,16 @@ VALID_ASPECTS = [
     "Office & Workspace",
     "Work Hours & Workload",
     "Career Growth & Opportunities",
+    "Process & Policies",
+    "HR & Recruitment",
+    "Project & Technology",
+    "Job Security",
 ]
 
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
 
 SYSTEM_PROMPT = """\
-You are an expert analyzer for Vietnamese employee reviews from ITViec (a Vietnamese IT job site).
+You are an expert analyzer for Vietnamese employee reviews.
 Reviews are written in Vietnamese or mixed Vietnamese-English (informal, with slang and teencode).
 
 Your job for each review is to return a single JSON object with exactly these fields:
@@ -84,16 +86,21 @@ Your job for each review is to return a single JSON object with exactly these fi
 Rules:
 1. is_review: Set to false if the text is NOT a real employee/candidate review — e.g. it's a question asking for reviews, a spam post, a nonsensical sentence, or completely unrelated to working at the company. Set to true for genuine reviews (positive or negative).
 
-2. review_masked: Replace the company name and ALL its variants (abbreviations, partial names, etc.) with [COMPANY]. The company name will be given to you. Keep the rest of the text unchanged.
+2. review_masked: Replace ONLY the specific company name and its variants (abbreviations, acronyms, partial names, etc.) with Company A B C. Do NOT replace generic words like "công ty", "cty", "công ti", "company", "tổ chức", "doanh nghiệp" — keep those as-is. The company name will be given to you. Keep the rest of the text unchanged.
 
-3. aspects: Extract only the aspects that are explicitly or clearly implied in the review. Each aspect must be one of:
-   - Salary & Benefits
-   - Training & Learning
-   - Management & Leadership
-   - Culture & Environment
-   - Office & Workspace
-   - Work Hours & Workload
-   - Career Growth & Opportunities
+3. aspects: Extract only the aspects that are explicitly or clearly implied in the review. Each aspect must be one of the following (use the exact label):
+
+   - Salary & Benefits: Any mentions of financial compensation, bonuses, insurance, or employee perks.
+   - Management & Leadership: Evaluations of managers' attitudes, leadership styles, and vision.
+   - Culture & Environment: The workplace atmosphere, social relationships, and shared company values.
+   - Work Hours & Workload: Working time, overtime (OT), pressure, and work-life balance.
+   - Career Growth & Opportunities: Promotion paths, career roadmaps, and long-term advancement potential.
+   - Process & Policies: Internal workflows, administrative procedures, and company regulations for current employees.
+   - Training & Learning: Mentorship, onboarding support, training courses, and knowledge-sharing activities.
+   - Office & Workspace: Physical facilities, office design, and provided work equipment (e.g., laptops, desks).
+   - HR & Recruitment: Experiences during the recruitment stages, including interviews and job offers.
+   - Project & Technology: The nature of projects, complexity of tasks, and the specific tech stack used.
+   - Job Security: Employment stability, contract clarity, and concerns regarding layoffs or job loss.
 
    sentiment must be "positive", "negative", or "neutral".
    If no aspects apply, return an empty list: "aspects": []
@@ -239,14 +246,14 @@ def process_row(review_text: str, company_name: str, model: str, base_url: str) 
             "aspect_sentiments": "",
         }
 
-    prompt = USER_TEMPLATE.format(company_name=company, review=review)
+    prompt = USER_TEMPLATE.format(company_name=company, review=review)  
     try:
         raw = call_ollama(prompt, model=model, base_url=base_url)
         return parse_result(raw, fallback_text=review)
     except Exception as exc:
         logger.error("Lỗi API | company=%r | review=%r | error=%s", company, review[:80], exc)
         return {
-            "is_review": None,
+            "is_review": "ERROR",
             "review_masked": review,
             "aspects_raw": "ERROR",
             "aspect_labels": "ERROR",
@@ -271,7 +278,7 @@ def find_col(df: pd.DataFrame, candidates: list) -> str | None:
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Xử lý review bằng LLM: lọc, mask, trích aspect")
-    parser.add_argument("excel_file", help="Đường dẫn tới file Excel (.xlsx)")
+    parser.add_argument("csv_file", help="Đường dẫn tới file CSV (.csv)")
     parser.add_argument("--test", type=int, default=0, metavar="N",
                         help="Chỉ chạy N dòng đầu để kiểm tra")
     parser.add_argument("--rerun", action="store_true",
@@ -280,20 +287,24 @@ def main():
                         help="Tên model Ollama (mặc định: gpt-oss:20b)")
     parser.add_argument("--ollama-url", default="http://14.224.236.84:8003/",
                         help="URL Ollama server")
-    parser.add_argument("--sheet", default=0,
-                        help="Tên hoặc index sheet Excel")
     parser.add_argument("--output", default=None, metavar="CSV_PATH",
                         help="Đường dẫn file CSV output")
     args = parser.parse_args()
 
-    excel_path = Path(args.excel_file)
-    if not excel_path.exists():
-        print(f"[LỖI] Không tìm thấy file: {excel_path}")
+    csv_path = Path(args.csv_file)
+    if not csv_path.exists():
+        print(f"[LỖI] Không tìm thấy file: {csv_path}")
         sys.exit(1)
 
-    sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
-    print(f"Đọc file: {excel_path}  (sheet: {sheet})")
-    df = pd.read_excel(excel_path, sheet_name=sheet, dtype=str)
+    # Output path — xác định sớm để kiểm tra resume
+    output_path = Path(args.output) if args.output else csv_path.with_name(csv_path.stem + "_processed.csv")
+
+    if not args.rerun and output_path.exists():
+        print(f"Tìm thấy file checkpoint, tiếp tục từ: {output_path}")
+        df = pd.read_csv(output_path, dtype=str, encoding="utf-8-sig")
+    else:
+        print(f"Đọc file: {csv_path}")
+        df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
     print(f"  → {len(df)} dòng, {len(df.columns)} cột: {list(df.columns)}")
 
     # Tìm cột review và company
@@ -319,7 +330,7 @@ def main():
     if args.rerun:
         mask = pd.Series([True] * len(df))
     else:
-        mask = df["is_review"].isna() | (df["is_review"].astype(str).str.strip() == "")
+        mask = df["is_review"].isna() | (df["is_review"].astype(str).str.strip().isin(["", "ERROR", "None"]))
 
     if args.test > 0:
         test_indices = df[mask].head(args.test).index
@@ -333,8 +344,6 @@ def main():
         print("Tất cả các dòng đã được xử lý. Dùng --rerun để chạy lại.")
         sys.exit(0)
 
-    # Output path
-    output_path = Path(args.output) if args.output else excel_path.with_name(excel_path.stem + "_processed.csv")
     print(f"File output: {output_path}")
 
     # Kiểm tra kết nối Ollama
@@ -354,9 +363,10 @@ def main():
     rows_to_process = df[mask].index.tolist()
     errors = 0
     skipped_not_review = 0
+    SAVE_EVERY = 10  # lưu checkpoint sau mỗi N dòng
 
     print()
-    for idx in tqdm(rows_to_process, desc="Xử lý", unit="dòng"):
+    for i, idx in enumerate(tqdm(rows_to_process, desc="Xử lý", unit="dòng")):
         result = process_row(
             review_text=df.at[idx, col_review],
             company_name=df.at[idx, col_company],
@@ -373,6 +383,10 @@ def main():
             errors += 1
         if result["is_review"] is False:
             skipped_not_review += 1
+
+        # Checkpoint: lưu định kỳ để không mất dữ liệu nếu máy tắt giữa chừng
+        if (i + 1) % SAVE_EVERY == 0:
+            df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
     # Lưu kết quả
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
