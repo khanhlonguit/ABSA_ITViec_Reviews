@@ -245,6 +245,26 @@ def find_col(df: pd.DataFrame, candidates: list) -> str | None:
     return None
 
 
+def model_ids_from_list_models_body(body: object) -> list[str]:
+    """
+    GET /v1/models JSON differs by provider:
+    - OpenAI / Groq: {"data": [{"id": "..."}, ...]}
+    - Together: [{"id": "..."}, ...]  (array at root)
+    """
+    if isinstance(body, list):
+        items = body
+    elif isinstance(body, dict):
+        raw = body.get("data", [])
+        items = raw if isinstance(raw, list) else []
+    else:
+        items = []
+    out: list[str] = []
+    for m in items:
+        if isinstance(m, dict) and "id" in m:
+            out.append(str(m["id"]))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -345,7 +365,7 @@ def main():
             timeout=10,
         )
         resp.raise_for_status()
-        available = [m["id"] for m in resp.json().get("data", [])]
+        available = model_ids_from_list_models_body(resp.json())
         if available and args.model not in available:
             print(f"  [CẢNH BÁO] Model '{args.model}' không thấy trong danh sách {provider.upper()}.")
             print(f"  Một số model có sẵn: {available[:20]}")
