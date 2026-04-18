@@ -65,6 +65,9 @@ GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_DEFAULT_MODEL = "gpt-5"
 
+TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
+TOGETHER_DEFAULT_MODEL = "openai/gpt-oss-120b"
+
 PROVIDER_CONFIG = {
     "groq": {
         "api_url": GROQ_API_URL,
@@ -77,6 +80,12 @@ PROVIDER_CONFIG = {
         "default_model": OPENAI_DEFAULT_MODEL,
         "env_key": "OPENAI_API_KEY",
         "models_url": "https://api.openai.com/v1/models",
+    },
+    "together": {
+        "api_url": TOGETHER_API_URL,
+        "default_model": TOGETHER_DEFAULT_MODEL,
+        "env_key": "TOGETHER_API_KEY",
+        "models_url": "https://api.together.xyz/v1/models",
     },
 }
 
@@ -246,8 +255,8 @@ def main():
                         help="Chỉ chạy N dòng đầu để kiểm tra")
     parser.add_argument("--rerun", action="store_true",
                         help="Xử lý lại các dòng đã có kết quả")
-    parser.add_argument("--provider", default="groq", choices=["groq", "openai"],
-                        help="Provider LLM: groq hoặc openai (mặc định: groq)")
+    parser.add_argument("--provider", default="groq", choices=["groq", "openai", "together"],
+                        help="Provider LLM: groq, openai hoặc together (mặc định: groq)")
     parser.add_argument("--model", default=None,
                         help="Tên model (mặc định: tùy provider)")
     parser.add_argument("--delay", type=float, default=0.5, metavar="SEC",
