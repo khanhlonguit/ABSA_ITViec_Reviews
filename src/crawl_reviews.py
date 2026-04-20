@@ -5,13 +5,14 @@ Web scraper for congty.review - Vietnamese company review platform.
 Crawls all companies and their reviews, exports to Excel (.xlsx) or CSV.
 
 Usage:
-    python src/crawl_reviews.py [--output PATH] [--test N] [--resume] [--max-reviews N]
+    python src/crawl_reviews.py [--output PATH] [--test N] [--resume] [--max-reviews N] [--exclude PATH]
     
 Examples:
     python src/crawl_reviews.py                                         # Full crawl → data/raw/reviews_congty.xlsx
     python src/crawl_reviews.py --test 5                                # Test with 5 companies
     python src/crawl_reviews.py --max-reviews 20000                     # Stop at 20,000 review rows total
     python src/crawl_reviews.py --output data/raw/reviews.csv --resume  # CSV + resume interrupted crawl
+    python src/crawl_reviews.py --exclude data/processed/company_list.csv  # Skip companies in list
 """
 
 import argparse
@@ -67,6 +68,7 @@ REQUEST_DELAY = 1.5  # Delay between requests in seconds
 REQUEST_TIMEOUT = 10  # Request timeout in seconds
 MAX_RETRIES = 3
 CHECKPOINT_INTERVAL = 50  # Save checkpoint every N companies
+FLUSH_INTERVAL = 10  # Save reviews to file every N reviews
 
 REVIEW_FIELDNAMES = [
     'reviewer_id', 'timestamp', 'review_content',
@@ -125,46 +127,51 @@ def clean_text(text: str) -> str:
 def parse_company_card(card_element) -> Optional[Dict[str, str]]:
     """Parse company information from a card element on homepage."""
     try:
-        # Find company link and name
-        link_elem = card_element.find('a', href=re.compile(r'/companies/'))
+        # Find company link: <a class="company-link" href="/companies/...">
+        link_elem = card_element.find('a', class_='company-link')
+        if not link_elem:
+            link_elem = card_element.find('a', href=re.compile(r'/companies/'))
         if not link_elem:
             return None
             
         company_url = urljoin(BASE_URL, link_elem.get('href', ''))
         company_slug = company_url.split('/companies/')[-1].split('?')[0]
         
-        # Company name - from link text or heading
-        name_elem = card_element.find(['h3', 'h2'])
-        if name_elem:
-            company_name = clean_text(name_elem.get_text())
-        else:
-            company_name = clean_text(link_elem.get_text())
+        # Company name - from the link text only (not the whole h3 which includes rating)
+        company_name = clean_text(link_elem.get_text())
         
-        # Review count - usually in parentheses like (24)
+        # Review count: <span class="company-info__rating-count">(51)</span>
         review_count = 0
-        review_match = re.search(r'\((\d+)\)', card_element.get_text())
-        if review_match:
-            review_count = int(review_match.group(1))
+        rating_count_elem = card_element.find('span', class_='company-info__rating-count')
+        if rating_count_elem:
+            review_match = re.search(r'\((\d+)\)', rating_count_elem.get_text())
+            if review_match:
+                review_count = int(review_match.group(1))
         
-        # Company type, size, address - usually in same card
-        meta_text = card_element.get_text()
+        # Company type & size: <div class="company-info__other">
         company_type = ""
         company_size = ""
-        company_address = ""
+        other_div = card_element.find('div', class_='company-info__other')
+        if other_div:
+            spans = other_div.find_all('span', recursive=False)
+            if len(spans) >= 1:
+                # First span has type (icon briefcase)
+                type_span = spans[0].find_all('span')
+                if type_span:
+                    company_type = clean_text(type_span[-1].get_text())
+            if len(spans) >= 2:
+                # Second span has size (icon users)
+                size_span = spans[1].find_all('span')
+                if size_span:
+                    company_size = clean_text(size_span[-1].get_text())
         
-        # Try to extract structured metadata
-        meta_parts = [clean_text(s) for s in meta_text.split('\n') if clean_text(s)]
-        for part in meta_parts:
-            # Type indicators: product, outsource, etc.
-            if part.lower() in ['product', 'outsource', 'agency marketing', 'imc', 'it', 'kinh doanh']:
-                company_type = part
-            # Size indicators: number ranges or keywords
-            elif re.match(r'\d+-\d+|\d+\+|1-50|51-150|151-500|501-1000|1000\+', part, re.IGNORECASE):
-                company_size = part
-            # Address: usually longer text without numbers-only pattern
-            elif len(part) > 15 and not re.match(r'^\d+$', part):
-                if 'District' in part or 'Quận' in part or 'Phường' in part or 'Ho Chi Minh' in part or 'Ha Noi' in part or 'Hà Nội' in part:
-                    company_address = part
+        # Address: <div class="company-info__location">
+        company_address = ""
+        location_div = card_element.find('div', class_='company-info__location')
+        if location_div:
+            loc_spans = location_div.find_all('span')
+            if loc_spans:
+                company_address = clean_text(loc_spans[-1].get_text())
         
         return {
             'company_name': company_name,
@@ -323,93 +330,36 @@ def crawl_company_reviews(company: Dict[str, str]) -> List[Dict[str, str]]:
         
         soup = BeautifulSoup(html, 'lxml')
         
-        # Find the main review section
-        review_section = soup.find(['div', 'section'], string=re.compile(r'Review công ty|reviews'))
-        if not review_section:
-            # Fallback: find by looking for multiple review links
-            review_section = soup
+        # Find all review cards: <div class="card card-rv">
+        review_cards = soup.find_all('div', class_='card-rv')
         
-        # Find all review links to identify boundaries
-        pattern = rf'/companies/{company_slug}/review/[a-f0-9-]+'
-        review_links = review_section.find_all('a', href=re.compile(pattern))
-        
-        if not review_links:
-            logger.warning(f"No review links found for {company_slug} page {page_num}")
+        if not review_cards:
+            logger.warning(f"No review cards found for {company_slug} page {page_num}")
             break
         
         page_reviews = []
         
-        # Process each review link
-        for idx, link in enumerate(review_links):
+        for card in review_cards:
             try:
-                reviewer_id = clean_text(link.get_text())
-                if not reviewer_id or len(reviewer_id) != 6:
+                # Reviewer ID: <span class="reviewer-link">
+                reviewer_span = card.find('span', class_='reviewer-link')
+                reviewer_id = clean_text(reviewer_span.get_text()) if reviewer_span else 'unknown'
+                
+                # Timestamp: <time class="time-ago">
+                time_elem = card.find('time', class_='time-ago')
+                timestamp = clean_text(time_elem.get_text()) if time_elem else 'unknown'
+                
+                # Review content: <div class="card-body"> > <p class="card-text text-content">
+                card_body = card.find('div', class_='card-body')
+                if not card_body:
                     continue
-                
-                # Get parent that contains review content (go up 4 levels)
-                parent = link
-                for _ in range(4):
-                    if parent and parent.parent:
-                        parent = parent.parent
-                
-                if not parent:
-                    continue
-                
-                # Get all text and find this review's segment
-                full_text = parent.get_text(separator='\n')
-                
-                # Find position of this reviewer ID in text
-                reviewer_pattern = rf'\b{re.escape(reviewer_id)}\b'
-                match = re.search(reviewer_pattern, full_text)
-                if not match:
-                    continue
-                
-                start_pos = match.end()
-                
-                # Find end position (next reviewer ID or "Reply")
-                end_pos = len(full_text)
-                
-                # Look for next reviewer (another hex ID)
-                if idx + 1 < len(review_links):
-                    next_reviewer_id = clean_text(review_links[idx + 1].get_text())
-                    if next_reviewer_id and len(next_reviewer_id) == 6:
-                        next_match = re.search(rf'\b{re.escape(next_reviewer_id)}\b', full_text[start_pos:])
-                        if next_match:
-                            end_pos = start_pos + next_match.start()
-                
-                # Also look for "Reply" or "Báo cáo" as boundaries
-                reply_match = re.search(r'\s+(Reply|Báo cáo)\s+', full_text[start_pos:end_pos])
-                if reply_match:
-                    end_pos = start_pos + reply_match.start()
-                
-                # Extract review text
-                review_text = full_text[start_pos:end_pos]
-                
-                # Clean up whitespace
-                review_text = re.sub(r'\s+', ' ', review_text).strip()
-                
-                # Extract timestamp from review text
-                timestamp = ""
-                time_patterns = [
-                    r'\d+\s*giờ\s*trước',
-                    r'\d+\s*ngày\s*trước',
-                    r'\d+\s*tháng\s*trước',
-                    r'\d+\s*năm\s*trước',
-                    r'Một giờ trước',
-                ]
-                for pattern_str in time_patterns:
-                    time_match = re.search(pattern_str, review_text, re.IGNORECASE)
-                    if time_match:
-                        timestamp = time_match.group(0)
-                        # Remove timestamp from content
-                        review_text = review_text.replace(timestamp, '', 1).strip()
-                        break
+                review_text = clean_text(card_body.get_text())
                 
                 # Validate content length
-                if len(review_text) > 20:
+                if review_text and len(review_text) > 20:
                     review_data = {
                         'reviewer_id': reviewer_id,
-                        'timestamp': timestamp or 'unknown',
+                        'timestamp': timestamp,
                         'review_content': review_text,
                         'company_name': company['company_name'],
                         'company_type': company['company_type'],
@@ -419,7 +369,7 @@ def crawl_company_reviews(company: Dict[str, str]) -> List[Dict[str, str]]:
                     page_reviews.append(review_data)
             
             except Exception as e:
-                logger.warning(f"Error parsing review {idx} for {company_slug}: {e}")
+                logger.warning(f"Error parsing review card for {company_slug}: {e}")
                 continue
         
         if page_reviews:
@@ -488,7 +438,7 @@ def count_reviews_in_output(output_path: Path) -> int:
             df = pd.read_excel(output_path, engine='openpyxl')
             return len(df)
         if suffix == '.csv':
-            with open(output_path, newline='', encoding='utf-8') as f:
+            with open(output_path, newline='', encoding='utf-8-sig') as f:
                 reader = csv.reader(f)
                 next(reader, None)  # skip header
                 return sum(1 for _ in reader)
@@ -507,7 +457,7 @@ def save_reviews_to_csv(reviews: List[Dict[str, str]], output_path: Path, mode: 
     file_exists = output_path.exists() and output_path.stat().st_size > 0
 
     try:
-        with open(output_path, mode=mode, newline='', encoding='utf-8') as f:
+        with open(output_path, mode=mode, newline='', encoding='utf-8-sig') as f:
             writer = csv.DictWriter(f, fieldnames=REVIEW_FIELDNAMES)
 
             if not file_exists or mode == 'w':
@@ -588,6 +538,13 @@ def main():
         help='Stop when total review rows in the output file reaches N (e.g. 20000). '
              'Existing rows in the file are counted when resuming.',
     )
+    parser.add_argument(
+        '--exclude',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='CSV file with company_name column. Companies in this list will be skipped.',
+    )
 
     args = parser.parse_args()
 
@@ -605,7 +562,25 @@ def main():
         logger.info(f"Test mode: {args.test} companies")
     if args.max_reviews:
         logger.info(f"Target: stop at {args.max_reviews} review rows (total in output file)")
+    if args.exclude:
+        logger.info(f"Exclude companies from: {args.exclude}")
     logger.info("=" * 60)
+
+    # Load exclude list
+    exclude_names = set()
+    if args.exclude:
+        exclude_path = Path(args.exclude)
+        if not exclude_path.is_absolute():
+            exclude_path = PROJECT_ROOT / exclude_path
+        if exclude_path.exists():
+            try:
+                exclude_df = pd.read_csv(exclude_path, encoding='utf-8-sig')
+                exclude_names = set(exclude_df['company_name'].str.strip().str.lower())
+                logger.info(f"Loaded {len(exclude_names)} companies to exclude")
+            except Exception as e:
+                logger.error(f"Failed to load exclude file: {e}")
+        else:
+            logger.warning(f"Exclude file not found: {exclude_path}")
     
     # Step 1: Get company list
     companies = []
@@ -631,6 +606,8 @@ def main():
     if args.max_reviews and total_reviews > 0:
         logger.info(f"Existing review rows in output file: {total_reviews}")
 
+    review_buffer = []  # Buffer to accumulate reviews before flushing
+
     for idx, company in enumerate(tqdm(companies[start_index:], desc="Crawling reviews", initial=start_index, total=len(companies))):
         actual_idx = start_index + idx
 
@@ -643,10 +620,21 @@ def main():
             logger.debug(f"Skipping {company['company_name']} (no reviews)")
             continue
 
+        # Skip companies in exclude list
+        if exclude_names and company.get('company_name', '').strip().lower() in exclude_names:
+            logger.info(f"Skipping {company['company_name']} (in exclude list)")
+            continue
+
         # Crawl reviews
         reviews = crawl_company_reviews(company)
 
         if not reviews:
+            continue
+
+        # Filter out reviews containing asterisk (*) masks
+        reviews = [r for r in reviews if '*' not in r.get('review_content', '')]
+        if not reviews:
+            logger.debug(f"All reviews for {company['company_name']} filtered (contain *)")
             continue
 
         if args.max_reviews:
@@ -656,8 +644,14 @@ def main():
             if len(reviews) > remaining:
                 reviews = reviews[:remaining]
 
-        append_reviews(reviews, output_path)
+        review_buffer.extend(reviews)
         total_reviews += len(reviews)
+
+        # Flush buffer to file every FLUSH_INTERVAL reviews
+        if len(review_buffer) >= FLUSH_INTERVAL:
+            append_reviews(review_buffer, output_path)
+            logger.info(f"Flushed {len(review_buffer)} reviews to file (total: {total_reviews})")
+            review_buffer = []
 
         # Periodic checkpoint
         if (actual_idx + 1) % CHECKPOINT_INTERVAL == 0:
@@ -667,6 +661,12 @@ def main():
             logger.info(f"Reached target of {args.max_reviews} review rows. Stopping crawl.")
             save_checkpoint(companies, output_path, actual_idx + 1)
             break
+
+    # Flush remaining reviews in buffer
+    if review_buffer:
+        append_reviews(review_buffer, output_path)
+        logger.info(f"Flushed remaining {len(review_buffer)} reviews to file (total: {total_reviews})")
+        review_buffer = []
 
     # Mark every company processed only if we did not stop early due to --max-reviews
     if args.max_reviews is None or total_reviews < args.max_reviews:
