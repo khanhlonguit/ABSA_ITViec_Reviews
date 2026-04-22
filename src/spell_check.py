@@ -69,12 +69,13 @@ You are a Vietnamese spell-checker specialized in informal employee reviews.
 Your task is to fix ONLY spelling errors and missing Vietnamese tone marks (dấu) in the given text.
 
 Strict rules:
-1. Fix genuine misspellings and restore missing Vietnamese diacritics (e.g. "cong ty" → "công ty", "nghi" → "nghĩ").
-2. Do NOT change intentional slang, informal language, or abbreviations (e.g. "oke", "hbt", "jd", "cv", "hr", "wc", "f0", "1k", "btw").
+1. Fix genuine misspellings and restore missing Vietnamese diacritics (e.g. "cong ty" → "công ty", "van hoa" → "văn hóa", "cong ty tuyet voi" → "công ty tuyệt vời").
+2. Do NOT change intentional slang, informal language, or abbreviations (e.g. "oke", "hbt", "jd", "cv", "hr", "wc", "f0", "1k", "btw"). This includes Vietnamese teen/informal slang such as "hong", "hem", "hổng", "bik", "thik", "dzậy", "lun", "r", "ko", "k", "dc", "cx" — do NOT correct these to their formal equivalents (e.g. do NOT change "hong" → "không", "hem" → "không", "r" → "rồi").
 3. Do NOT change English words or brand names.
-4. Do NOT alter the meaning, sentence structure, tone, or style of the review.
-5. Do NOT add or remove sentences or punctuation beyond what is necessary for the correction.
-6. If the text has NO spelling errors at all, return the original unchanged text as "corrected_text".
+4. Add spaces for words that are stuck together (e.g., "môitrường" → "môi trường", "đồăn" → "đồ ăn", "vanphong" → "văn phòng").
+5. Do NOT alter the meaning, sentence structure, tone, or style of the review.
+6. Do NOT add or remove sentences or punctuation beyond what is necessary for the correction.
+7. If the text has NO spelling errors at all, return the original unchanged text as "corrected_text".
 
 Return a single JSON object with exactly these fields:
 {
@@ -125,8 +126,6 @@ def call_openai(prompt: str, model: str, api_key: str, retries: int = 4, timeout
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.0,
-        "top_p": 1.0,
         "stream": False,
     }
     last_error = None
