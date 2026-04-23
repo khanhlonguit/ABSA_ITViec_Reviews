@@ -83,12 +83,12 @@ Strict rules:
 7. Add spaces for words that are stuck together (e.g., "môitrường" → "môi trường", "đồăn" → "đồ ăn", "vanphong" → "văn phòng").
 8. Do NOT alter the meaning, sentence structure, tone, or style of the review.
 9. Do NOT add or remove sentences or punctuation beyond what is necessary for the correction.
-10. If the text has NO spelling errors at all, return the original unchanged text as "corrected_text".
+10. If the text has NO spelling errors at all, set has_error to false and return an EMPTY STRING "" as corrected_text.
 
 Return a single JSON object with exactly these fields:
 {
   "has_error": <true if any spelling error was found and fixed, false otherwise>,
-  "corrected_text": "<full corrected review text>",
+  "corrected_text": "<full corrected review text if has_error is true, otherwise empty string>",
   "changes": "<concise description of corrections in Vietnamese, e.g. 'Thêm dấu cho: cong ty → công ty, nghi → nghĩ'. Empty string if no changes.>"
 }
 
@@ -240,8 +240,12 @@ def parse_result(raw: str, original_text: str) -> dict:
         has_error = has_error.lower() == "true"
     default["spell_has_error"] = bool(has_error)
 
-    corrected = data.get("corrected_text", "").strip()
-    default["review_content_corrected"] = corrected if corrected else original_text
+    if not has_error:
+        # Không có lỗi: dùng thẳng original, không lấy corrected_text từ LLM
+        default["review_content_corrected"] = data.get("corrected_text", "").strip()
+    else:
+        corrected = data.get("corrected_text", "").strip()
+        default["review_content_corrected"] = corrected if corrected else original_text
 
     changes = data.get("changes", "")
     default["spell_changes"] = str(changes).strip() if changes else ""
