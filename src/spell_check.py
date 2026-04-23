@@ -13,14 +13,19 @@ Kết quả ghi vào cột mới: review_content_corrected
 Nếu review không có lỗi hoặc là spam thì sao chép nguyên gốc.
 
 Sử dụng:
-    python src/spell_check.py data/done/review-Long-part2-filtered.csv --provider openai
-    python src/spell_check.py data/done/review-Long-part2-filtered.csv --provider openai --test 10
-    python src/spell_check.py data/done/review-Long-part2-filtered.csv --provider openai --model gpt-4o
-    python src/spell_check.py data/done/review-Long-part2-filtered.csv --provider openai --output data/done/result.csv
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --provider openai
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --provider openai --test 10
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --provider openai --model gpt-4o
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --provider openai --output data/final_data/result.csv
+
+    # Lọc theo is_review:
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --filter true     # chỉ is_review=TRUE (mặc định)
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --filter false    # chỉ is_review=FALSE
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --filter all      # tất cả các dòng
 
     # Dùng Together AI:
-    python src/spell_check.py data/done/review-Long-part2-filtered.csv --provider together
-    python src/spell_check.py data/done/review-Long-part2-filtered.csv --provider together --model meta-llama/Llama-3.3-70B-Instruct-Turbo
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --provider together
+    python src/spell_check.py data/final_data/data_final_sorted_cleaned.csv --provider together --model meta-llama/Llama-3.3-70B-Instruct-Turbo
 
 Cấu trúc output CSV thêm các cột:
     review_content_corrected : review đã sửa chính tả
@@ -174,7 +179,7 @@ def call_together(prompt: str, model: str, api_key: str, retries: int = 4, timeo
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.0,
+        "temperature": 0.5,
         "top_p": 1.0,
         "stream": False,
     }
@@ -301,10 +306,8 @@ def main():
                         help="Chỉ chạy N dòng đầu để kiểm tra")
     parser.add_argument("--rerun", action="store_true",
                         help="Xử lý lại các dòng đã có kết quả")
-    parser.add_argument("--only-verified", action="store_true", default=True,
-                        help="Chỉ xử lý dòng có human_verified hoặc Long_verified == TRUE (mặc định: bật)")
-    parser.add_argument("--all-rows", action="store_true",
-                        help="Xử lý tất cả các dòng, bỏ qua filter verified")
+    parser.add_argument("--filter", default="true", choices=["all", "true", "false"],
+                        help="Lọc theo cột is_review: 'true' (mặc định), 'false', hoặc 'all'")
     parser.add_argument("--provider", default="openai", choices=["openai", "together"],
                         help="LLM provider: 'openai' (mặc định) hoặc 'together'")
     parser.add_argument("--model", default=None,
@@ -359,37 +362,18 @@ def main():
             df[col] = ""
 
     # Xác định dòng cần xử lý
-    # 1. Chỉ lấy những review hợp lệ (verified) trừ khi --all-rows
-    if args.all_rows:
+    # 1. Lọc theo --filter (cột is_review)
+    col_is_review = find_col(df, ["is_review"])
+    if args.filter == "all":
         valid_mask = pd.Series([True] * len(df))
         print("  → Chế độ: xử lý TẤT CẢ các dòng")
+    elif col_is_review is None:
+        valid_mask = pd.Series([True] * len(df))
+        print("  [CẢNH BÁO] Không tìm thấy cột is_review, sẽ xử lý tất cả các dòng")
     else:
-        col_human = find_col(df, ["human_verified"])
-        col_long = find_col(df, ["long_verified"])
-
-        # Tìm các dòng được đánh dấu là review thực (TRUE) hoặc chưa được lọc
-        # Ưu tiên: human_verified = TRUE hoặc Long_verified = TRUE
-        true_vals = {"true", "1", "yes", "x"}
-        if col_human and col_long:
-            valid_mask = (
-                df[col_human].str.strip().str.lower().isin(true_vals) |
-                df[col_long].str.strip().str.lower().isin(true_vals)
-            )
-        elif col_human:
-            valid_mask = df[col_human].str.strip().str.lower().isin(true_vals)
-        elif col_long:
-            valid_mask = df[col_long].str.strip().str.lower().isin(true_vals)
-        else:
-            # Fallback: thử dùng cột is_review_* nếu có
-            col_is_review = find_col(df, ["is_review_gpt-5", "is_review", "is_review_gpt"])
-            if col_is_review:
-                valid_mask = df[col_is_review].str.strip().str.upper() == "TRUE"
-                print(f"  → Lọc theo cột '{col_is_review}' == TRUE")
-            else:
-                valid_mask = pd.Series([True] * len(df))
-                print("  [CẢNH BÁO] Không tìm thấy cột verified, sẽ xử lý tất cả các dòng")
-
-        print(f"  → Dòng được verified (hợp lệ): {valid_mask.sum()} / {len(df)}")
+        target = "TRUE" if args.filter == "true" else "FALSE"
+        valid_mask = df[col_is_review].astype(str).str.strip().str.upper() == target
+        print(f"  → Lọc: {col_is_review} == {target} | {valid_mask.sum()} / {len(df)} dòng")
 
     # 2. Dòng verified chưa xử lý → gọi LLM
     if args.rerun:
