@@ -71,11 +71,14 @@ Your task is to fix ONLY spelling errors and missing Vietnamese tone marks (dấ
 Strict rules:
 1. Fix genuine misspellings and restore missing Vietnamese diacritics (e.g. "cong ty" → "công ty", "van hoa" → "văn hóa", "cong ty tuyet voi" → "công ty tuyệt vời").
 2. Do NOT change intentional slang, informal language, or abbreviations (e.g. "oke", "hbt", "jd", "cv", "hr", "wc", "f0", "1k", "btw"). This includes Vietnamese teen/informal slang such as "hong", "hem", "hổng", "bik", "thik", "dzậy", "lun", "r", "ko", "k", "dc", "cx" — do NOT correct these to their formal equivalents (e.g. do NOT change "hong" → "không", "hem" → "không", "r" → "rồi").
-3. Do NOT change English words or brand names.
-4. Add spaces for words that are stuck together (e.g., "môitrường" → "môi trường", "đồăn" → "đồ ăn", "vanphong" → "văn phòng").
-5. Do NOT alter the meaning, sentence structure, tone, or style of the review.
-6. Do NOT add or remove sentences or punctuation beyond what is necessary for the correction.
-7. If the text has NO spelling errors at all, return the original unchanged text as "corrected_text".
+3. Do NOT change Southern Vietnamese dialect spellings or pronunciation variants. Examples: "pà con" (= bà con), "dzậy" (= vậy), "gì dzậy" (= gì vậy), "vô" (= vào), "mần" (= làm). These are intentional regional forms, NOT spelling errors.
+4. Do NOT change words that are correct Vietnamese but less common. Examples: "chỉn chu" (= cẩn thận, neat), "thoải mái", "hào phóng". Do NOT silently replace them with a different word.
+5. When in doubt whether a word is a typo or intentional slang/dialect — leave it unchanged.
+6. Do NOT change English words or brand names.
+7. Add spaces for words that are stuck together (e.g., "môitrường" → "môi trường", "đồăn" → "đồ ăn", "vanphong" → "văn phòng").
+8. Do NOT alter the meaning, sentence structure, tone, or style of the review.
+9. Do NOT add or remove sentences or punctuation beyond what is necessary for the correction.
+10. If the text has NO spelling errors at all, return the original unchanged text as "corrected_text".
 
 Return a single JSON object with exactly these fields:
 {
@@ -388,24 +391,37 @@ def main():
 
         print(f"  → Dòng được verified (hợp lệ): {valid_mask.sum()} / {len(df)}")
 
-    # 2. Lọc thêm: chưa được xử lý (hoặc bị lỗi lần trước)
+    # 2. Dòng verified chưa xử lý → gọi LLM
     if args.rerun:
-        needs_process = valid_mask
+        needs_llm = valid_mask.copy()
     else:
         done_mask = (
             df["spell_has_error"].astype(str).str.strip().isin(["True", "False", "true", "false"])
         )
-        needs_process = valid_mask & ~done_mask
+        needs_llm = valid_mask & ~done_mask
+
+    # Dòng không verified, chưa có review_content_corrected → chỉ copy, không gọi LLM
+    not_done_corrected = df["review_content_corrected"].astype(str).str.strip().isin(["", "nan"])
+    needs_copy = ~valid_mask & not_done_corrected
+
+    # Gộp lại, rồi mới apply --test limit lên toàn bộ
+    all_to_handle = needs_llm | needs_copy
 
     if args.test > 0:
-        test_indices = df[needs_process].head(args.test).index
-        needs_process = pd.Series(False, index=df.index)
-        needs_process[test_indices] = True
-        print(f"\n[TEST MODE] Chỉ xử lý {needs_process.sum()} dòng.\n")
+        test_indices = df[all_to_handle].head(args.test).index
+        all_to_handle = pd.Series(False, index=df.index)
+        all_to_handle[test_indices] = True
+        needs_llm = needs_llm & all_to_handle
+        needs_copy = needs_copy & all_to_handle
+        print(f"\n[TEST MODE] Xử lý {all_to_handle.sum()} dòng (LLM: {needs_llm.sum()}, copy: {needs_copy.sum()}).\n")
     else:
-        print(f"\nSẽ xử lý {needs_process.sum()} / {len(df)} dòng cần spell-check.\n")
+        print(f"\nSẽ xử lý {all_to_handle.sum()} dòng (LLM: {needs_llm.sum()}, copy: {needs_copy.sum()}).\n")
 
-    if needs_process.sum() == 0:
+    all_rows_to_handle = df[all_to_handle].sort_index().index.tolist()
+
+    if len(all_rows_to_handle) == 0:
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        print(f"\n✓ Đã lưu: {output_path}")
         print("Không có dòng nào cần xử lý. Dùng --rerun để chạy lại.")
         sys.exit(0)
 
@@ -444,48 +460,59 @@ def main():
             print(f"  [CẢNH BÁO] Không kiểm tra được Together AI: {exc}")
 
     # Vòng lặp xử lý
-    rows_to_process = df[needs_process].index.tolist()
     errors = 0
     has_errors_count = 0
+    copied_count = 0
     SAVE_EVERY = 10
 
     print()
-    for i, idx in enumerate(tqdm(rows_to_process, desc="Spell-check", unit="dòng")):
-        result = process_row(
-            review_text=df.at[idx, col_review],
-            model=args.model,
-            provider=args.provider,
-            openai_api_key=openai_api_key,
-            together_api_key=together_api_key,
-        )
-
-        if args.delay > 0:
-            time.sleep(args.delay)
+    for i, idx in enumerate(tqdm(all_rows_to_handle, desc="Spell-check", unit="dòng")):
+        if needs_llm[idx]:
+            result = process_row(
+                review_text=df.at[idx, col_review],
+                model=args.model,
+                provider=args.provider,
+                openai_api_key=openai_api_key,
+                together_api_key=together_api_key,
+            )
+            if args.delay > 0:
+                time.sleep(args.delay)
+            if result["spell_has_error"] == "ERROR":
+                errors += 1
+            elif result["spell_has_error"] is True:
+                has_errors_count += 1
+        else:
+            # Dòng bị bỏ qua: copy nguyên gốc, không gọi LLM
+            orig = df.at[idx, col_review]
+            result = {
+                "review_content_corrected": str(orig) if pd.notna(orig) else "",
+                "spell_has_error": "False",
+                "spell_changes": "",
+            }
+            copied_count += 1
 
         df.at[idx, "review_content_corrected"] = result["review_content_corrected"]
         df.at[idx, "spell_has_error"] = str(result["spell_has_error"])
         df.at[idx, "spell_changes"] = result["spell_changes"]
-
-        if result["spell_has_error"] == "ERROR":
-            errors += 1
-        elif result["spell_has_error"] is True:
-            has_errors_count += 1
 
         if (i + 1) % SAVE_EVERY == 0:
             df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
     # Lưu kết quả cuối
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    llm_count = needs_llm.sum()
     print(f"\n✓ Đã lưu: {output_path}")
-    print(f"  Tổng dòng xử lý         : {len(rows_to_process)}")
+    print(f"  Tổng dòng xử lý         : {len(all_rows_to_handle)}")
+    print(f"    - Gọi LLM             : {llm_count}")
+    print(f"    - Copy nguyên bản     : {copied_count}")
     print(f"  Phát hiện có lỗi CT     : {has_errors_count}")
-    print(f"  Không có lỗi             : {len(rows_to_process) - has_errors_count - errors}")
+    print(f"  Không có lỗi             : {llm_count - has_errors_count - errors}")
     print(f"  Lỗi API                  : {errors}")
     if errors:
         print(f"  Chi tiết lỗi             : logs/spell_check_errors.log")
 
     # Thống kê mẫu: in ra vài dòng đã sửa
-    corrected_df = df.loc[needs_process & (df["spell_has_error"].astype(str) == "True")]
+    corrected_df = df.loc[needs_llm & (df["spell_has_error"].astype(str).isin(["True", "true"]))]
     if not corrected_df.empty:
         print(f"\n--- Ví dụ {min(5, len(corrected_df))} dòng đã sửa ---")
         for _, row in corrected_df.head(5).iterrows():
