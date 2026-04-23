@@ -384,7 +384,7 @@ def main():
         needs_llm = valid_mask.copy()
     else:
         done_mask = (
-            df["spell_has_error"].astype(str).str.strip().isin(["True", "False", "true", "false"])
+            df["spell_has_error"].astype(str).str.strip().str.upper().isin(["TRUE", "FALSE"])
         )
         needs_llm = valid_mask & ~done_mask
 
@@ -500,7 +500,7 @@ def main():
         print(f"  Chi tiết lỗi             : logs/spell_check_errors.log")
 
     # Thống kê mẫu: in ra vài dòng đã sửa
-    corrected_df = df.loc[needs_llm & (df["spell_has_error"].astype(str).isin(["True", "true"]))]
+    corrected_df = df.loc[needs_llm & (df["spell_has_error"].astype(str).str.upper() == "TRUE")]
     if not corrected_df.empty:
         print(f"\n--- Ví dụ {min(5, len(corrected_df))} dòng đã sửa ---")
         for _, row in corrected_df.head(5).iterrows():
