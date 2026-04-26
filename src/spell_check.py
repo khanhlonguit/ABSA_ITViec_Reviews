@@ -119,8 +119,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPEN_CLAUDE_API_URL = "https://open-claude.com/v1/chat/completions"
+CHATGPT_PLUS_API_URL = "http://localhost:8317/v1/chat/completions"
 OPENAI_DEFAULT_MODEL = "gpt-5"
 OPEN_CLAUDE_DEFAULT_MODEL = "chatgpt5.4"
+CHATGPT_PLUS_DEFAULT_MODEL = "gpt-5.4"
+CHATGPT_PLUS_DEFAULT_API_KEY = "proxypal-local"
 
 def call_open_claude(prompt: str, model: str, api_key: str, retries: int = 4, timeout: int = 120) -> str:
     if not api_key:
@@ -144,12 +147,20 @@ def call_open_claude(prompt: str, model: str, api_key: str, retries: int = 4, ti
             if resp.status_code == 429:
                 retry_after = resp.headers.get("retry-after")
                 wait = float(retry_after) if retry_after else min(2 ** attempt, 60)
-                logger.error("OpenClaude 429 rate-limit | attempt=%d | wait=%.1fs", attempt, wait)
+                logger.error(
+                    "OpenClaude 429 rate-limit | attempt=%d | wait=%.1fs | body=%s",
+                    attempt, wait, resp.text[:500],
+                )
                 if attempt <= retries:
                     time.sleep(wait)
                     continue
-                raise RuntimeError(f"OpenClaude rate-limit vượt giới hạn sau {retries + 1} lần")
-            resp.raise_for_status()
+                raise RuntimeError(f"OpenClaude rate-limit vượt giới hạn sau {retries + 1} lần | body={resp.text[:500]}")
+            if not resp.ok:
+                logger.error(
+                    "OpenClaude HTTP %d | attempt=%d | body=%s",
+                    resp.status_code, attempt, resp.text[:500],
+                )
+                resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
         except RuntimeError:
             raise
@@ -158,6 +169,42 @@ def call_open_claude(prompt: str, model: str, api_key: str, retries: int = 4, ti
             if attempt <= retries:
                 time.sleep(min(2 * attempt, 30))
     raise RuntimeError(f"OpenClaude API thất bại sau {retries + 1} lần: {last_error}")
+
+def call_chatgpt_plus(prompt: str, model: str, api_key: str, retries: int = 4, timeout: int = 120) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+    }
+    last_error = None
+    for attempt in range(1, retries + 2):
+        try:
+            resp = requests.post(CHATGPT_PLUS_API_URL, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("retry-after")
+                wait = float(retry_after) if retry_after else min(2 ** attempt, 60)
+                logger.error("ChatGPT Plus 429 rate-limit | attempt=%d | wait=%.1fs", attempt, wait)
+                if attempt <= retries:
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"ChatGPT Plus rate-limit vượt giới hạn sau {retries + 1} lần")
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt <= retries:
+                time.sleep(min(2 * attempt, 30))
+    raise RuntimeError(f"ChatGPT Plus API thất bại sau {retries + 1} lần: {last_error}")
+
 
 def call_openai(prompt: str, model: str, api_key: str, retries: int = 4, timeout: int = 120) -> str:
     if not api_key:
@@ -301,6 +348,7 @@ def process_row(
     openai_api_key: str = "",
     together_api_key: str = "",
     open_claude_api_key: str = "",
+    chatgpt_plus_api_key: str = CHATGPT_PLUS_DEFAULT_API_KEY,
 ) -> dict:
     review = str(review_text).strip() if pd.notna(review_text) else ""
 
@@ -317,6 +365,8 @@ def process_row(
             raw = call_together(user_prompt, model=model, api_key=together_api_key)
         elif provider == "open_claude":
             raw = call_open_claude(user_prompt, model=model, api_key=open_claude_api_key)
+        elif provider == "chatgpt_plus":
+            raw = call_chatgpt_plus(user_prompt, model=model, api_key=chatgpt_plus_api_key)
         else:
             raw = call_openai(user_prompt, model=model, api_key=openai_api_key)
         return parse_result(raw, original_text=review)
@@ -353,8 +403,8 @@ def main():
                         help="Xử lý lại các dòng đã có kết quả")
     parser.add_argument("--filter", default="true", choices=["all", "true", "false"],
                         help="Lọc theo cột is_review: 'true' (mặc định), 'false', hoặc 'all'")
-    parser.add_argument("--provider", default="openai", choices=["openai", "together", "open_claude"],
-                        help="LLM provider: 'openai' (mặc định) hoặc 'together' hoặc 'open_claude'")
+    parser.add_argument("--provider", default="openai", choices=["openai", "together", "open_claude", "chatgpt_plus"],
+                        help="LLM provider: 'openai' (mặc định), 'together', 'open_claude', hoặc 'chatgpt_plus' (local proxy)")
     parser.add_argument("--model", default=None,
                         help=(
                             "Tên model. Mặc định theo provider: "
@@ -373,12 +423,14 @@ def main():
         "openai": OPENAI_DEFAULT_MODEL,
         "together": TOGETHER_DEFAULT_MODEL,
         "open_claude": OPEN_CLAUDE_DEFAULT_MODEL,
+        "chatgpt_plus": CHATGPT_PLUS_DEFAULT_MODEL,
     }
     if args.model is None:
         args.model = DEFAULT_MODELS.get(args.provider, OPENAI_DEFAULT_MODEL)
     openai_api_key = os.environ.get("OPENAI_API_KEY", "")
     together_api_key = os.environ.get("TOGETHER_API_KEY", "")
     open_claude_api_key = os.environ.get("OPEN_CLAUDE_API_KEY", "")
+    chatgpt_plus_api_key = os.environ.get("CHATGPT_PLUS_API_KEY", CHATGPT_PLUS_DEFAULT_API_KEY)
 
     csv_path = Path(args.csv_file)
     if not csv_path.exists():
@@ -506,6 +558,7 @@ def main():
                 openai_api_key=openai_api_key,
                 together_api_key=together_api_key,
                 open_claude_api_key=open_claude_api_key,
+                chatgpt_plus_api_key=chatgpt_plus_api_key,
             )
             if args.delay > 0:
                 time.sleep(args.delay)
