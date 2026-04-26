@@ -1,20 +1,21 @@
 """
 check_mask.py
 -------------
-Duyệt qua từng review trong file CSV, gọi LLM (Groq) để kiểm tra xem
+Duyệt qua từng review trong file CSV, gọi LLM (ChatGPT Plus local proxy) để kiểm tra xem
 các ký tự mask (***) đã đúng hay chưa.
   - Nếu đúng → giữ nguyên.
   - Nếu sai  → khôi phục lại nội dung gốc.
 
 Sử dụng:
-    python check_mask.py reviews_mask.csv
-    python check_mask.py reviews_mask.csv --test 5
-    python check_mask.py reviews_mask.csv --output result.csv --rerun
-    python check_mask.py reviews_mask.csv --model oss-120b
+    python src/check_mask.py reviews_mask.csv
+    python src/check_mask.py reviews_mask.csv --test 5
+    python src/check_mask.py reviews_mask.csv --output result.csv --rerun
+    python src/check_mask.py reviews_mask.csv --model gpt-5.2
 
 Cấu trúc output CSV thêm các cột:
-    mask_status       : Correct / Incorrect
-    recovered_content : Nội dung review sau khi khôi phục (nếu sai)
+    is_masked            : true / false / ERROR / PARSE_ERROR
+    review_content_masked: Nội dung review sau khi đã mask tên người/công ty
+    masked_details       : Mô tả các thực thể đã mask (vd: 'FPT → [COMPANY]')
 """
 
 import argparse
@@ -53,39 +54,38 @@ if MISSING:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_DEFAULT_MODEL = "oss-120b"
+CHATGPT_PLUS_API_URL = "http://localhost:8317/v1/chat/completions"
+CHATGPT_PLUS_DEFAULT_MODEL = "gpt-5.2"
+CHATGPT_PLUS_DEFAULT_API_KEY = "proxypal-local"
 
 SYSTEM_PROMPT = """\
-You are an expert in Natural Language Processing (NLP) with an in-depth understanding of the IT labor market in Vietnam.
+Role: You are a Data Privacy Expert and NLP Specialist. Your task is to anonymize Vietnamese company reviews by masking sensitive entities.
 
-Context: I have a dataset of company reviews from ITviec. In this dataset, proper names (individuals, projects) and company names are often masked using asterisks (*). However, there are two specific scenarios:
+Task:
 
-Correct Masking: The number of asterisks matches the character count of the hidden word (e.g., 'Sếp Tùng' -> 'Sếp T***').
+1. Identify all mentions of Company Names (including the specific company provided below, its abbreviations, or nicknames).
+2. Identify all mentions of Person Names (including managers, CEOs, staff, or colleagues).
+3. Determine if the review contains any unmasked sensitive entities.
+4. If masking is needed, replace Person Names with [PERSON] and Company Names with [COMPANY].
 
-Incorrect Masking: The asterisks are placed inconsistently, do not match the character length, or accidentally mask common words instead of proper names.
+Guidelines:
 
-Your Task:
-Analyze the review content provided below and perform the following steps:
-
-Determine whether the asterisk-containing phrases (*) in the text are masked logically and are easy to interpret (Classify as: 'Correct' or 'Incorrect').
-
-If 'Incorrect' (faulty masking or loss of crucial information): Use the context of the entire review to recover or restore the most likely word/name.
-
-If 'Correct': Retain the original masked text as it is.
-
-Return the final result strictly in JSON format.
+ - Do not mask technical terms, programming languages, or general positions (e.g., "Sếp", "Developer", "HR") unless they are followed by a specific name.
+ - If the review is already perfectly masked or contains no names, set is_masked to false
 
 Output Format Requirement (Return ONLY JSON):
 {
-  "status": "Correct/Incorrect",
-  "recovered_content": "The entire review content after recovery or normalization of the masks"
+  "is_masked": <true if any name/company was identified and masked, false otherwise>,
+  "review_content_masked": "<full review with [PERSON]/[COMPANY] tags — ONLY if is_masked is true, otherwise empty string>",
+  "masked_details": "<e.g. 'FPT Software → [COMPANY], Anh Tùng → [PERSON]' — ONLY if is_masked is true, otherwise empty string>"
 }
 """
 
 USER_TEMPLATE = """\
 Review Data:
 '{review}'
+company_name:
+'{company}'
 """
 
 # ---------------------------------------------------------------------------
@@ -96,11 +96,9 @@ logger = logging.getLogger("check_mask")
 
 
 # ---------------------------------------------------------------------------
-# Groq API
+# ChatGPT Plus local proxy API
 # ---------------------------------------------------------------------------
-def call_groq(prompt: str, model: str, api_key: str, retries: int = 6, timeout: int = 120) -> str:
-    if not api_key:
-        raise ValueError("Groq API key chưa được cung cấp. Dùng biến môi trường GROQ_API_KEY.")
+def call_chatgpt_plus(prompt: str, model: str, api_key: str, retries: int = 4, timeout: int = 120) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -111,25 +109,20 @@ def call_groq(prompt: str, model: str, api_key: str, retries: int = 6, timeout: 
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.0,
-        "top_p": 1.0,
         "stream": False,
     }
     last_error = None
     for attempt in range(1, retries + 2):
         try:
-            resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
+            resp = requests.post(CHATGPT_PLUS_API_URL, headers=headers, json=payload, timeout=timeout)
             if resp.status_code == 429:
-                retry_after = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset-requests")
-                if retry_after:
-                    wait = float(retry_after)
-                else:
-                    wait = min(2 ** attempt, 60)
-                logger.error("Groq 429 rate-limit | attempt=%d | wait=%.1fs", attempt, wait)
+                retry_after = resp.headers.get("retry-after")
+                wait = float(retry_after) if retry_after else min(2 ** attempt, 60)
+                logger.error("ChatGPT Plus 429 rate-limit | attempt=%d | wait=%.1fs", attempt, wait)
                 if attempt <= retries:
                     time.sleep(wait)
                     continue
-                raise RuntimeError(f"Groq rate-limit vượt giới hạn sau {retries + 1} lần")
+                raise RuntimeError(f"ChatGPT Plus rate-limit vượt giới hạn sau {retries + 1} lần")
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
         except RuntimeError:
@@ -138,7 +131,7 @@ def call_groq(prompt: str, model: str, api_key: str, retries: int = 6, timeout: 
             last_error = exc
             if attempt <= retries:
                 time.sleep(min(2 * attempt, 30))
-    raise RuntimeError(f"Groq API thất bại sau {retries + 1} lần: {last_error}")
+    raise RuntimeError(f"ChatGPT Plus API thất bại sau {retries + 1} lần: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -156,52 +149,51 @@ def extract_json_str(raw: str) -> str:
 # Parse LLM output
 # ---------------------------------------------------------------------------
 def parse_result(raw: str, fallback_text: str) -> dict:
-    default = {
-        "mask_status": "",
-        "recovered_content": fallback_text,
-    }
     try:
         json_str = extract_json_str(raw)
         data = json.loads(json_str)
     except (json.JSONDecodeError, Exception) as exc:
         logger.error("JSON parse error: %s | raw=%r", exc, raw[:300])
-        default["mask_status"] = "PARSE_ERROR"
-        return default
+        return {"is_masked": "PARSE_ERROR", "review_content_masked": "", "masked_details": ""}
 
-    status = str(data.get("status", "")).strip()
-    if status.lower() in ("correct", "incorrect"):
-        default["mask_status"] = status.capitalize()
-    else:
-        default["mask_status"] = status or "PARSE_ERROR"
+    is_masked = data.get("is_masked", False)
+    if isinstance(is_masked, str):
+        is_masked = is_masked.lower() == "true"
 
-    recovered = data.get("recovered_content", "")
-    default["recovered_content"] = str(recovered).strip() if recovered else fallback_text
+    if not is_masked:
+        return {"is_masked": False, "review_content_masked": "", "masked_details": ""}
 
-    return default
+    masked_text = data.get("review_content_masked")
+    masked_details = data.get("masked_details")
+    return {
+        "is_masked": True,
+        "review_content_masked": str(masked_text).strip() if masked_text else "",
+        "masked_details": str(masked_details).strip() if masked_details else "",
+    }
 
 
 # ---------------------------------------------------------------------------
 # Process a single row
 # ---------------------------------------------------------------------------
-def process_row(review_text: str, model: str, api_key: str) -> dict:
+def process_row(
+    review_text: str,
+    company_name: str,
+    model: str,
+    chatgpt_plus_api_key: str = CHATGPT_PLUS_DEFAULT_API_KEY,
+) -> dict:
     review = str(review_text).strip() if pd.notna(review_text) else ""
+    company = str(company_name).strip() if pd.notna(company_name) else ""
 
-    if not review or "*" not in review:
-        return {
-            "mask_status": "No_Mask",
-            "recovered_content": review,
-        }
+    if not review:
+        return {"is_masked": False, "review_content_masked": "", "masked_details": ""}
 
-    user_prompt = USER_TEMPLATE.format(review=review)
+    user_prompt = USER_TEMPLATE.format(review=review, company=company)
     try:
-        raw = call_groq(user_prompt, model=model, api_key=api_key)
+        raw = call_chatgpt_plus(user_prompt, model=model, api_key=chatgpt_plus_api_key)
         return parse_result(raw, fallback_text=review)
     except Exception as exc:
-        logger.error("Lỗi API | review=%r | error=%s", review[:80], exc)
-        return {
-            "mask_status": "ERROR",
-            "recovered_content": review,
-        }
+        logger.error("Lỗi API | company=%r | review=%r | error=%s", company, review[:80], exc)
+        return {"is_masked": "ERROR", "review_content_masked": "", "masked_details": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +218,8 @@ def main():
                         help="Chỉ chạy N dòng đầu để kiểm tra")
     parser.add_argument("--rerun", action="store_true",
                         help="Xử lý lại các dòng đã có kết quả")
-    parser.add_argument("--model", default=GROQ_DEFAULT_MODEL,
-                        help=f"Tên model Groq (mặc định: {GROQ_DEFAULT_MODEL})")
+    parser.add_argument("--model", default=CHATGPT_PLUS_DEFAULT_MODEL,
+                        help=f"Tên model ChatGPT Plus proxy (mặc định: {CHATGPT_PLUS_DEFAULT_MODEL})")
     parser.add_argument("--delay", type=float, default=0.5, metavar="SEC",
                         help="Thời gian chờ (giây) giữa mỗi request (mặc định 0.5)")
     parser.add_argument("--output", default=None, metavar="CSV_PATH",
@@ -237,7 +229,7 @@ def main():
     args = parser.parse_args()
 
     load_dotenv()
-    groq_api_key = os.environ.get("GROQ_API_KEY", "")
+    chatgpt_plus_api_key = os.environ.get("CHATGPT_PLUS_API_KEY", CHATGPT_PLUS_DEFAULT_API_KEY)
 
     csv_path = Path(args.csv_file)
     if not csv_path.exists():
@@ -262,8 +254,8 @@ def main():
             sys.exit(1)
     else:
         col_review = find_col(df, [
-            "review_content_masked", "review_masked", "review_content_cleaned",
-            "review_content", "review", "combined_review",
+            "review_content_corrected", "review_content_masked", "review_masked",
+            "review_content_cleaned", "review_content", "review", "combined_review",
         ])
     if col_review is None:
         print(f"[LỖI] Không tìm thấy cột review. Các cột hiện có: {list(df.columns)}")
@@ -271,24 +263,25 @@ def main():
 
     print(f"  → Cột review: '{col_review}'")
 
+    col_company = find_col(df, ["company_name", "company"])
+    if col_company is None:
+        print("  [CẢNH BÁO] Không tìm thấy cột company_name, sẽ để trống.")
+    else:
+        print(f"  → Cột company: '{col_company}'")
+
     # Khởi tạo cột output nếu chưa có
-    for col in ["mask_status", "recovered_content"]:
+    for col in ["is_masked", "review_content_masked", "masked_details"]:
         if col not in df.columns:
             df[col] = ""
 
-    # Xác định dòng cần xử lý: chỉ xử lý dòng có chứa *
-    has_mask = df[col_review].fillna("").str.contains(r"\*", regex=True)
+    # Xác định dòng cần xử lý
+    has_text = df[col_review].fillna("").str.strip() != ""
 
     if args.rerun:
-        mask = has_mask.copy()
+        mask = has_text.copy()
     else:
-        not_done = df["mask_status"].isna() | (df["mask_status"].astype(str).str.strip().isin(["", "ERROR", "PARSE_ERROR"]))
-        mask = has_mask & not_done
-
-    # Đánh dấu các dòng không có * là No_Mask
-    no_mask_rows = ~has_mask & (df["mask_status"].isna() | (df["mask_status"].astype(str).str.strip() == ""))
-    df.loc[no_mask_rows, "mask_status"] = "No_Mask"
-    df.loc[no_mask_rows, "recovered_content"] = df.loc[no_mask_rows, col_review]
+        done_mask = df["is_masked"].astype(str).str.strip().str.upper().isin(["TRUE", "FALSE"])
+        mask = has_text & ~done_mask
 
     if args.test > 0:
         test_indices = df[mask].head(args.test).index
@@ -296,7 +289,7 @@ def main():
         mask[test_indices] = True
         print(f"\n[TEST MODE] Chỉ xử lý {mask.sum()} dòng.\n")
     else:
-        print(f"\nSẽ xử lý {mask.sum()} / {len(df)} dòng có mask cần kiểm tra.\n")
+        print(f"\nSẽ xử lý {mask.sum()} / {len(df)} dòng cần mask.\n")
 
     if mask.sum() == 0:
         print("Không có dòng nào cần xử lý. Dùng --rerun để chạy lại.")
@@ -305,55 +298,34 @@ def main():
         sys.exit(0)
 
     print(f"File output: {output_path}")
-
-    # Kiểm tra kết nối Groq
-    print(f"\nKiểm tra kết nối Groq (model: {args.model}) ...")
-    if not groq_api_key:
-        print("  [LỖI] Chưa có Groq API key. Cài đặt biến môi trường GROQ_API_KEY.")
-        sys.exit(1)
-    try:
-        resp = requests.get(
-            "https://api.groq.com/openai/v1/models",
-            headers={"Authorization": f"Bearer {groq_api_key}"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        available = [m["id"] for m in resp.json().get("data", [])]
-        if available and args.model not in available:
-            print(f"  [CẢNH BÁO] Model '{args.model}' không thấy trong danh sách Groq.")
-            print(f"  Các model có sẵn: {available}")
-        else:
-            print("  ✓ Kết nối Groq OK.")
-    except Exception as exc:
-        print(f"  [CẢNH BÁO] Không kiểm tra được Groq: {exc}")
+    print(f"\nDùng ChatGPT Plus local proxy tại {CHATGPT_PLUS_API_URL} (model: {args.model}) ...")
 
     # Vòng lặp xử lý
     rows_to_process = df[mask].index.tolist()
     errors = 0
-    correct_count = 0
-    incorrect_count = 0
+    masked_count = 0
     SAVE_EVERY = 10
 
     print()
-    for i, idx in enumerate(tqdm(rows_to_process, desc="Kiểm tra mask", unit="dòng")):
+    for i, idx in enumerate(tqdm(rows_to_process, desc="Mask review", unit="dòng")):
         result = process_row(
             review_text=df.at[idx, col_review],
+            company_name=df.at[idx, col_company] if col_company else "",
             model=args.model,
-            api_key=groq_api_key,
+            chatgpt_plus_api_key=chatgpt_plus_api_key,
         )
 
         if args.delay > 0:
             time.sleep(args.delay)
 
-        df.at[idx, "mask_status"] = result["mask_status"]
-        df.at[idx, "recovered_content"] = result["recovered_content"]
+        df.at[idx, "is_masked"] = str(result["is_masked"])
+        df.at[idx, "review_content_masked"] = result["review_content_masked"]
+        df.at[idx, "masked_details"] = result["masked_details"]
 
-        if result["mask_status"] == "ERROR":
+        if str(result["is_masked"]).upper() == "ERROR":
             errors += 1
-        elif result["mask_status"] == "Correct":
-            correct_count += 1
-        elif result["mask_status"] == "Incorrect":
-            incorrect_count += 1
+        elif result["is_masked"] is True:
+            masked_count += 1
 
         if (i + 1) % SAVE_EVERY == 0:
             df.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -362,9 +334,11 @@ def main():
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"\n✓ Đã lưu: {output_path}")
     print(f"  Tổng xử lý : {len(rows_to_process)}")
-    print(f"  Correct     : {correct_count}")
-    print(f"  Incorrect   : {incorrect_count}")
-    print(f"  Errors      : {errors}")
+    print(f"  Có mask     : {masked_count}")
+    print(f"  Không mask  : {len(rows_to_process) - masked_count - errors}")
+    print(f"  Lỗi API    : {errors}")
+    if errors:
+        print(f"  Chi tiết lỗi: logs/")
 
 
 if __name__ == "__main__":
