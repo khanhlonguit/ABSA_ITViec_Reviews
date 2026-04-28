@@ -9,3 +9,5 @@ lxml
 emoji
 dotenv
 python-dotenv
+underthesea
+matplotlib
