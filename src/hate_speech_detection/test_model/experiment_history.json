@@ -1,0 +1,20 @@
+[
+  {
+    "model_name": "vinai/phobert-large",
+    "timestamp": "2026-05-05T14:09:57Z",
+    "f1_macro": 0.252588,
+    "eval_loss": 1.001127,
+    "saved_model": "C:\\Users\\18520\\Workspace\\ABSA_ITViec_Reviews\\src\\hate_speech_detection\\test_model\\saved_models\\phobert-large-hsd",
+    "test_f1_macro": 0.2551440329218107,
+    "test_loss": 0.9813113212585449,
+    "train_runtime": 799.3746,
+    "train_samples": 800,
+    "max_length": 256,
+    "epochs": 1,
+    "batch_size": 2,
+    "learning_rate": 2e-05,
+    "smoke_test": true,
+    "gpu_mode": false,
+    "seed": 42
+  }
+]
